@@ -37,6 +37,14 @@ This project provides:
 
 ## Installation
 
+This repo is intended for a linux OS, but will function on WSL with a bit of setup
+
+<details>
+
+<summary> Linux OS (e.g. Ubuntu) </summary>
+
+### Linux OS (e.g. Ubuntu)
+
 You’ll need Python ≥ 3.8.
 
 Install Python dependencies:
@@ -50,6 +58,95 @@ System dependencies:
 ```
 sudo apt install uhubctl
 ```
+
+</details>
+
+<details>
+
+<summary> Windows Subsystem for Linux (WSL) </summary>
+
+### Windows Subsystem for Linux (WSL)
+
+If you are not using Linux or don't want to set up dual boot you can use WSL to access the functionality of linux alongside your windows OS.
+
+If you have not already installed WSL, open an administrator powershell terminal and type the following:
+
+```
+wsl --install
+```
+
+More details on WSL installation can be found at https://learn.microsoft.com/en-us/windows/wsl/install
+
+Following the instructions here: https://learn.microsoft.com/en-us/windows/wsl/connect-usb#attach-a-usb-device, first download and run the latest usbipd-win.msi file 
+(should look like eg 'usbipd-win_5.3.0_x64.msi')
+
+With the detector plugged into a usb port, back in powershell (admin) run the following to show the available usb devices:
+```
+usbipd list
+```
+this should show something like the following:
+```
+PS C:\Users\em22501> usbipd list
+Connected:
+BUSID  VID:PID    DEVICE                                                        STATE
+1-3    0bda:557a  Integrated Webcam, Camera DFU Device                          Not shared
+1-12   0661:2917  Unknown device                                                Attached
+1-14   8087:0033  Intel(R) Wireless Bluetooth(R)                                Not shared
+```
+
+In this example case the hamamatsu is the 'Unknown device' at ```<busid>=1-12```. Your device may differ. To check which one it is, simply run usbipd list again with the detector unplugged and see which device is missing. Note that different usb ports on your computer may give different values here and may require separate bindings.
+
+Now bind the device to the usbipd configuration
+```
+usbipd bind --busid <busid>
+```
+
+And with wsl running (start it in another terminal if you haven't already) attach the bound device to the open WSL instance:
+- NOTE YOU NEED TO DO THIS ATTACHING STEP EVERY TIME YOU START UP WSL OR UN/REPLUG IN THE DEVICE
+If you want you can set up a script to do this more quickly without having to do it all in the command line which will save time
+
+
+```
+usbipd attach --wsl --busid <busid>
+```
+
+Now in the wsl terminal check the usb devices:
+```
+lsusb
+```
+
+this should return something like the following:
+```
+em22501@IT107326:/mnt/c/Users/em22501$ lsusb
+Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 001 Device 002: ID 0661:2917 Hamamatsu Photonics K.K.
+Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+```
+
+Make a note of the ID of the detector, in this example case: 0661:2917. This will be used later and corresponds to ```<idVendor>:<idProduct>```. This should remain static for the same detector, though different individual devices may differ.
+
+Now you will almost certainly encounter a 'USBError: [Errno 13] Access denied (insufficient permissions)' error if you attempt to run the example acquisition script at this point. In this case you need to define a permission rule for your ubuntu system to associate with the detector. To do this, following instructions here: https://discuss.pylabrobot.org/t/dealing-with-usberror-errno-13-access-denied-insufficient-permissions-on-debian/52, in your linux file system go to
+```
+/etc/udev/rules.d/
+```
+and create a new rules file by opening a new document with super user power:
+```
+sudo nano /etc/udev/rules.d/99-usb.rules
+```
+In the text editor add the following line (using the idVendor and idProduct from earlier) and save:
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="<idVendor>", ATTR{idProduct}=="<idProduct>", MODE="0666"
+```
+
+Now reset the udev rules system and trigger the new rule:
+```
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Finally restart WSL, re-attach the detector and try to run the example acquisition script to test the setup.
+
+</details>
 
 ---
 
