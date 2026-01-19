@@ -59,6 +59,46 @@ System dependencies:
 sudo apt install uhubctl
 ```
 
+#### Udev rules
+
+In order to use this package without super user privlidges, the correct udev rules need to be configured. 
+
+The udev rule must contain the Vendor Id and the product Id, both of which can be found by plugging in the device and typing `lsusb`. Your output will be made up of lines looking something like this:
+
+```
+Bus 001 Device 007: ID 0661:2917 Hamamatsu Photonics K.K. 
+```
+The area of interest is the ID section. The first string (in this case, 0661) is the Vendor ID, and the second string (2917) is the Product ID. In order to access the device without root permissions we must include a udev rule which contains this information.
+
+Navigate to the /etc/udev/rules.d directory, and create a new rules file. Rules files must end in .rules, and start with a number. The number sets the precdence of the rules, but for our purpose this is not significant: just ensure the number is between 50-100.
+
+Your udev rule should contain the following information:
+```
+SUBSYSTEM=="usb", ATTRS{idVendor}==PID, ATTRS{idProduct}==VID , MODE="0666", GROUP="plugdev"
+```
+For the Hamamatsu detector shown above, the rule would be:
+```
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0661", ATTRS{idProduct}=="2917", MODE="0666", GROUP="plugdev"
+```
+Adding MODE="0666" gives general read/write permission to the detector.
+
+Make sure you are in the plugdev group with `sudo adduser *username* plugdev`. If you were not previously in the plugdev group you will need to log in again, or restart your computer.
+
+Finally, reload the udev rules with:
+```
+udevadm control --reload-rules
+udevadm trigger
+```
+
+You also should add yourself to the dialout group with:
+
+```
+sudo usermod -a -G dialout $USER
+```
+where $USER is your username
+**If the detector is plugged in, make sure you unplug it and plug back in before running the code again**
+
+
 </details>
 
 <details>
