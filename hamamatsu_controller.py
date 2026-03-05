@@ -3,14 +3,20 @@ Hamamatsu Detector Controller
 =============================
 
 Thread-safe controller for the Hamamatsu scintillation detector using USB.
+Uses c12137_comm.C12137Device for all low-level USB communication.
 
-This provides a high-level interface similar to the D3SController:
+Provides:
  - Continuous background acquisition in a thread
  - Cumulative 4096-channel spectrum
  - Real-time counts-per-second (CPS) estimate
  - Temperature and device time reporting
  - Timed (fixed-duration) acquisition
  - Periodic logging with delta_t and cumulative spectrum
+ - Energy threshold get/set
+ - Radiation limit get/set
+ - EEPROM read
+ - Internal temperature read
+ - Module reset
 """
 
 import os
@@ -19,220 +25,47 @@ import threading
 from typing import Optional, Tuple
 
 import numpy as np
-import usb.core
-import usb.util
-from struct import unpack
 
+from c12137_comm import (
+    C12137Device,
+    RDMUSB_SUCCESS,
+    RDMUSB_PACKET_ERROR,
+    EEPROM_COMP_LEVEL,
+    EEPROM_ENERGY_LOWER,
+    EEPROM_ENERGY_UPPER,
+    EEPROM_CONVERT_USV,
+)
 
-class HamamatsuDetector:
-    """Low-level interface to the Hamamatsu detector over USB."""
-
-    def __init__(self, port=None, uhubctl=False, verbose: int = 1, virtual: bool = False):
-        self.port = port
-        self.uhubctl = uhubctl
-        self.timeOverflows = 0
-        self.previousTimeIndex = 0
-        self.status = "pre init"
-        self.verbose = verbose
-        self.virtualDevice = virtual
-        self.timeIndex = 0
-        self.temperature = float("nan")
-        self.deviceTime = 0.0
-
-        tic = time.time()
-
-        if self.virtualDevice:
-            self.bootDuration = 0
-            self.status = "OK"
-            return
-
-        # power cycle, if requested
-        if self.uhubctl is None:
-            time.sleep(1)
-        else:
-            self.powerCycle()
-
-        # find device
-        if not self.getDevice():
-            return
-
-        # set up USB endpoint
-        self.device.reset()
-        self.device.reset()  # belt & braces
-        self.device.set_configuration()
-        self.status = "initializing"
-
-        self.configuration = self.device.get_active_configuration()
-        self.interface = self.configuration[(0, 0)]
-        self.endpoint = self.interface[0]
-        self.ep = self.endpoint
-        self.maxPacketSize8 = self.ep.wMaxPacketSize
-        self.maxPacketSize16 = self.ep.wMaxPacketSize // 2
-        self.bootDuration = time.time() - tic
-        self.status = "OK"
-
-    def powerCycle(self):
-        """Power-cycle USB hub to fix freezing (requires `uhubctl` on the system)."""
-        if os.system("which uhubctl >/dev/null 2>&1") != 0:
-            if self.verbose:
-                print("uhubctl not installed — skipping power cycle.")
-            return
-
-        if isinstance(self.uhubctl, str):
-            addressString = self.uhubctl
-        elif self.uhubctl:  # True: try to infer from port
-            if self.port is None:
-                self.getDevice()
-            addressString = " -l 1-"
-            for val in self.port[:-1]:
-                addressString += f"{val}."
-            addressString = addressString[:-1] + f" -p {self.port[-1]}"
-        else:
-            return
-
-        if self.verbose > 0:
-            os.system(f"uhubctl -a off {addressString}")
-            time.sleep(3)
-            os.system(f"uhubctl -a on {addressString}")
-            time.sleep(3)
-        elif self.verbose == 0:
-            print(f"Powercycling {addressString}")
-            os.system(f"uhubctl -a off {addressString} >/dev/null 2>&1")
-            time.sleep(3)
-            os.system(f"uhubctl -a on {addressString} >/dev/null 2>&1")
-            time.sleep(3)
-        self.status = "power cycle complete"
-
-    def getDevice(self) -> bool:
-        """Find the Hamamatsu USB device."""
-        devices = list(usb.core.find(idVendor=0x0661, idProduct=0x2917, find_all=True))
-        if len(devices) == 0:
-            device = None
-            self.status = "device not found"
-        else:
-            if self.port is None:
-                if len(devices) == 1:
-                    device = devices[0]
-                else:
-                    print("Multiple Hamamatsus detected; please specify port.")
-                    self.status = "multiple devices"
-                    device = None
-            else:
-                foundDevice = False
-                for device in devices:
-                    if device.port_numbers == self.port:
-                        foundDevice = True
-                        break
-                if not foundDevice:
-                    self.status = "device not found"
-                    device = None
-
-        if device is None:
-            self.device = None
-            print("ERROR: Could not find Hamamatsu at port", self.port)
-            return False
-
-        self.device = device
-        self.port = self.device.port_numbers
-        self.status = "device found"
-        return True
-
-    def processHeader(self) -> bool:
-        """Read and parse the dataframe header."""
-        if self.virtualDevice:
-            self.detectorEvents = 1000
-            self.timeIndex = (self.timeIndex + 1) % 65336
-            self.tempADC = 50000
-        else:
-            while True:
-                try:
-                    self.data = self.device.read(
-                        self.ep.bEndpointAddress, self.ep.wMaxPacketSize, 100
-                    )
-                    (
-                        self.headerStart,
-                        self.detectorEvents,
-                        self.timeIndex,
-                        self.tempADC,
-                    ) = unpack(">LHxxHHxxxx", self.data[0:16])
-                except Exception:
-                    return False
-                if self.headerStart == 1515870810:
-                    break
-                if self.verbose > 0:
-                    print(
-                        f"Bad header start value {self.headerStart} - resyncing data frame"
-                    )
-            self.headerData = self.data[16:]
-
-        # time overflow handling
-        if self.previousTimeIndex - self.timeIndex > 65000:
-            self.timeOverflows += 1
-        self.deviceTime = (65536 * self.timeOverflows + self.timeIndex) / 10.0
-        # temperature
-        self.temperature = 188.686 - 0.00348 * self.tempADC
-        return True
-
-    def processReadings(self) -> bool:
-        """Read the 12-bit channel data into self.channels."""
-        self.channels = np.zeros(1048, dtype=np.uint16)
-        if self.virtualDevice:
-            self.channels[:1000] = np.random.randint(0, 65336, 1000, dtype=np.uint16)
-            return True
-
-        try:
-            # first 24 channels from header remnant
-            self.channels[:24] = unpack("<" + "H" * 24, self.headerData)
-            self.headerData = None
-            # remaining channels
-            for address in range(24, 1048, self.maxPacketSize16):
-                self.data = self.device.read(
-                    self.ep.bEndpointAddress, self.ep.wMaxPacketSize, 100
-                )
-                self.channels[address : address + self.maxPacketSize16] = unpack(
-                    "<" + "H" * self.maxPacketSize16, self.data
-                )
-        except Exception:
-            return False
-        return True
-
-    def binChannels(self, binning: int = 16):
-        """Bin raw channels into 4096-channel spectrum bins."""
-        self.channelBinning = binning
-        self.binnedChannels = np.floor_divide(self.channels, self.channelBinning)
+GE_TABLE_SIZE = 4096
 
 
 class HamamatsuController:
     """
-    High-level threaded controller for Hamamatsu detector.
+    High-level threaded controller for Hamamatsu C12137 detector.
+
+    Uses C12137Device from c12137_comm for all USB communication.
 
     Provides:
+      - connect(), disconnect()
       - start(), stop(), reset()
       - get_spectrum() -> (spectrum, elapsed, cps, temperature, device_time)
       - acquire_spectrum_for_duration()
       - start_periodic_logging() / stop_periodic_logging()
+      - get/set energy threshold, radiation limits
+      - read EEPROM, internal temperature, module reset
     """
 
-    def __init__(
-        self,
-        port=None,
-        uhubctl=True,
-        verbose: int = 1,
-        virtual: bool = False,
-    ):
-        self.port = port
-        self.uhubctl = uhubctl
+    def __init__(self, verbose: int = 1):
         self.verbose = verbose
-        self.virtual = virtual
 
-        self.detector: Optional[HamamatsuDetector] = None
+        self.dev = C12137Device()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._running = False
         self._stop_event = threading.Event()
 
         # Spectrum & timing
-        self.spectrum = np.zeros(4096, dtype=np.uint32)
+        self.spectrum = np.zeros(GE_TABLE_SIZE, dtype=np.uint32)
         self.elapsed_time = 0.0
         self._start_time = None
 
@@ -244,6 +77,8 @@ class HamamatsuController:
         # Telemetry
         self.temperature = float("nan")
         self.device_time = 0.0
+        self._last_pkt_index: Optional[int] = None
+        self._time_overflows = 0
 
         # Logging
         self._log_thread: Optional[threading.Thread] = None
@@ -254,6 +89,31 @@ class HamamatsuController:
         self.last_delta_t: Optional[float] = None
 
     # --------------------------------------------------------
+    # CONNECTION
+    # --------------------------------------------------------
+
+    def connect(self) -> bool:
+        """Find and open the detector USB device."""
+        ok = self.dev.find_and_open()
+        if ok and self.verbose:
+            print("Device connected successfully.")
+        elif not ok and self.verbose:
+            print("ERROR: Device not found.")
+        return ok
+
+    def disconnect(self):
+        """Stop acquisition and close USB."""
+        if self._running:
+            self.stop()
+        self.dev.close()
+        if self.verbose:
+            print("Device disconnected.")
+
+    @property
+    def is_connected(self) -> bool:
+        return self.dev.is_open
+
+    # --------------------------------------------------------
     # START / STOP
     # --------------------------------------------------------
 
@@ -261,12 +121,17 @@ class HamamatsuController:
         """Start background acquisition."""
         if self._running:
             return
+        if not self.dev.is_open:
+            if not self.connect():
+                return
         if self.verbose:
             print("Starting HamamatsuController...")
+        self.dev.clear_bulk_buffer()
         self._stop_event.clear()
         self._running = True
         self._start_time = time.time()
-        self._thread = threading.Thread(target=self._acquisition_loop)
+        self._last_pkt_index = None
+        self._thread = threading.Thread(target=self._acquisition_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
@@ -280,11 +145,6 @@ class HamamatsuController:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         self._running = False
-        if self.detector and hasattr(self.detector, "device"):
-            try:
-                usb.util.dispose_resources(self.detector.device)
-            except Exception:
-                pass
         if self.verbose:
             print("HamamatsuController stopped cleanly.")
 
@@ -293,81 +153,68 @@ class HamamatsuController:
     # --------------------------------------------------------
 
     def _acquisition_loop(self):
-        """Continuous acquisition loop with automatic device handling."""
+        """Continuous acquisition loop using C12137Device bulk reads."""
+        retry = 0
+        max_retries = 10
+        prev_pkt_index: Optional[int] = None
+
         while not self._stop_event.is_set():
-            # (Re)create detector
-            self.detector = HamamatsuDetector(
-                port=self.port,
-                uhubctl=self.uhubctl,
-                verbose=self.verbose,
-                virtual=self.virtual,
-            )
-            if self.detector.status != "OK":
-                if self.verbose:
-                    print("Detector init failed, retrying in 2 seconds...")
-                time.sleep(2)
+            status, pkt_index, size, data, temp = self.dev.get_data_and_temperature()
+
+            if status == RDMUSB_PACKET_ERROR:
+                time.sleep(0.02)
+                retry += 1
+                if retry > max_retries:
+                    self.dev.clear_bulk_buffer()
+                    retry = 0
+                continue
+            elif status != RDMUSB_SUCCESS:
+                time.sleep(0.02)
+                self.dev.clear_bulk_buffer()
+                retry += 1
+                if retry > max_retries:
+                    if self.verbose:
+                        print("Too many read failures — stopping acquisition.")
+                    break
                 continue
 
-            looptime = 0.1
-            loop_step = 0.001
+            retry = 0
 
-            if self.verbose:
-                print("Hamamatsu setup complete. Entering acquisition loop...")
+            # Skip duplicate packets
+            if prev_pkt_index is not None and pkt_index == prev_pkt_index:
+                time.sleep(0.02)
+                continue
 
-            while not self._stop_event.is_set():
-                try:
-                    time.sleep(max(0.0, looptime))
+            # Track device time via packet index (increments every 100 ms)
+            if prev_pkt_index is not None and prev_pkt_index > pkt_index + 60000:
+                self._time_overflows += 1
+            device_time = (65536 * self._time_overflows + pkt_index) / 10.0
+            prev_pkt_index = pkt_index
 
-                    if not self.detector.processHeader():
-                        if self.verbose:
-                            print("Header read failed — restarting.")
-                        break
-                    if not self.detector.processReadings():
-                        if self.verbose:
-                            print("Channel read failed — restarting.")
-                        break
+            # Bin events into 4096-channel spectrum
+            now = time.time()
+            with self._lock:
+                self.temperature = temp
+                self.device_time = device_time
+                self.elapsed_time = now - self._start_time
 
-                    # Bin channels (protect against missing data)
-                    if hasattr(self.detector, "channels") and len(self.detector.channels) > 0:
-                        self.detector.binChannels(16)
-                        if not hasattr(self.detector, "binnedChannels"):
-                            if self.verbose:
-                                print("binChannels() failed — skipping this frame.")
-                            continue
-                    else:
-                        if self.verbose:
-                            print("No channel data — skipping this frame.")
-                        continue
+                for word in data:
+                    address = (word >> 4) & 0x0FFF
+                    if 0 <= address < GE_TABLE_SIZE:
+                        self.spectrum[address] += 1
 
-                    counts = np.bincount(
-                        self.detector.binnedChannels[: self.detector.detectorEvents],
-                        minlength=4096,
-                    ).astype(np.uint32)
+                total_counts = int(self.spectrum.sum())
+                self._history.append((now, total_counts))
+                self._history = [
+                    (t, c) for t, c in self._history if now - t <= self._cps_window
+                ]
+                if len(self._history) > 1:
+                    dt = self._history[-1][0] - self._history[0][0]
+                    if dt > 0:
+                        dc = self._history[-1][1] - self._history[0][1]
+                        self.cps = dc / dt
 
-                    now = time.time()
-                    with self._lock:
-                        self.spectrum += counts
-                        self.elapsed_time = now - self._start_time
-                        self.temperature = self.detector.temperature
-                        self.device_time = self.detector.deviceTime
-
-                        total_counts = int(self.spectrum.sum())
-                        self._history.append((now, total_counts))
-                        self._history = [(t, c) for t, c in self._history if now - t <= self._cps_window]
-                        if len(self._history) > 1:
-                            dt = self._history[-1][0] - self._history[0][0]
-                            if dt > 0:
-                                dc = self._history[-1][1] - self._history[0][1]
-                                self.cps = dc / dt
-
-                except Exception as e:
-                    if self.verbose:
-                        print(f"Acquisition error: {e}")
-                    break
-
-
-            if self.verbose:
-                print("Lost communication with detector, attempting restart...")
+            time.sleep(0.02)  # ~50 Hz polling
 
         if self.verbose:
             print("Acquisition loop exited cleanly.")
@@ -384,6 +231,9 @@ class HamamatsuController:
             self.elapsed_time = 0.0
             self.cps = 0.0
             self._history.clear()
+            self._time_overflows = 0
+        if self.dev.is_open:
+            self.dev.clear_bulk_buffer()
         if self.verbose:
             print("Spectrum reset.")
 
@@ -406,6 +256,54 @@ class HamamatsuController:
             temp = self.temperature
             dev_time = self.device_time
         return spec, elapsed, cps, temp, dev_time
+
+    # --------------------------------------------------------
+    # ENERGY THRESHOLD
+    # --------------------------------------------------------
+
+    def get_energy_threshold(self) -> Tuple[int, int]:
+        """Return (status, threshold_index)."""
+        return self.dev.get_energy_threshold()
+
+    def set_energy_threshold(self, index_val: int) -> int:
+        """Set the energy threshold (as channel index). Returns status."""
+        return self.dev.set_energy_threshold(index_val)
+
+    # --------------------------------------------------------
+    # RADIATION LIMITS
+    # --------------------------------------------------------
+
+    def get_radiation_limit(self, area: int) -> Tuple[int, int]:
+        """area=0 → lower, area=1 → upper.  Return (status, keV value)."""
+        return self.dev.get_radiation_limit(area)
+
+    def set_radiation_limit(self, area: int, value_kev: int) -> int:
+        """Set radiation limit. area=0 → lower, area=1 → upper. Returns status."""
+        return self.dev.set_radiation_limit(area, value_kev)
+
+    # --------------------------------------------------------
+    # EEPROM
+    # --------------------------------------------------------
+
+    def read_eeprom(self, address: int) -> Tuple[int, int]:
+        """Read an EEPROM address. Return (status, data)."""
+        return self.dev.read_eeprom(address)
+
+    # --------------------------------------------------------
+    # INTERNAL TEMPERATURE
+    # --------------------------------------------------------
+
+    def get_internal_temperature(self) -> Tuple[int, float]:
+        """Return (status, celsius) from the I²C temperature sensor."""
+        return self.dev.get_internal_temperature()
+
+    # --------------------------------------------------------
+    # MODULE RESET
+    # --------------------------------------------------------
+
+    def reset_module(self, level: int = 0) -> int:
+        """Reset the detector module hardware. Returns status."""
+        return self.dev.reset(level)
 
     # --------------------------------------------------------
     # TIMED ACQUISITION
@@ -480,7 +378,7 @@ class HamamatsuController:
         with open(filename, "w") as f:
             f.write("delta_t," + ",".join([f"ch{i}" for i in range(4096)]) + "\n")
 
-        self._log_thread = threading.Thread(target=self._logging_loop)
+        self._log_thread = threading.Thread(target=self._logging_loop, daemon=True)
         self._log_thread.start()
         if self.verbose:
             dur = "indefinitely" if total_time == 0 else f"for {total_time}s"

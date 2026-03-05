@@ -5,6 +5,7 @@ Example: HamamatsuController Timed and Periodic Acquisitions
 Demonstrates:
  1. A fixed-duration timed acquisition with a simple plot.
  2. A periodic logging acquisition with a live updating plot.
+ 3. Energy threshold and EEPROM read examples.
 
 Requirements:
     pip install pyusb numpy matplotlib
@@ -15,6 +16,48 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from hamamatsu_controller import HamamatsuController
+from c12137_comm import RDMUSB_SUCCESS, EEPROM_COMP_LEVEL, EEPROM_ENERGY_LOWER, EEPROM_ENERGY_UPPER
+
+
+def example_device_info():
+    """
+    Example 0: Read energy threshold, radiation limits, and EEPROM values.
+    """
+    print("\n=== Hamamatsu Device Info Example ===")
+    ctrl = HamamatsuController(verbose=True)
+    if not ctrl.connect():
+        print("Could not connect to device.")
+        return
+
+    # Energy threshold
+    status, idx = ctrl.get_energy_threshold()
+    if status == RDMUSB_SUCCESS:
+        print(f"Energy threshold index: {idx}")
+
+    # Radiation limits
+    status, lower = ctrl.get_radiation_limit(0)
+    if status == RDMUSB_SUCCESS:
+        print(f"Radiation lower limit: {lower} keV")
+    status, upper = ctrl.get_radiation_limit(1)
+    if status == RDMUSB_SUCCESS:
+        print(f"Radiation upper limit: {upper} keV")
+
+    # Internal temperature
+    status, temp = ctrl.get_internal_temperature()
+    if status == RDMUSB_SUCCESS:
+        print(f"Internal temperature: {temp:.1f} °C")
+
+    # EEPROM
+    for addr, name in [
+        (EEPROM_COMP_LEVEL, "Comparator threshold"),
+        (EEPROM_ENERGY_LOWER, "Energy lower limit"),
+        (EEPROM_ENERGY_UPPER, "Energy upper limit"),
+    ]:
+        status, val = ctrl.read_eeprom(addr)
+        if status == RDMUSB_SUCCESS:
+            print(f"EEPROM [{addr:#04x}] {name} = {val}")
+
+    ctrl.disconnect()
 
 
 def example_timed_acquisition():
@@ -47,6 +90,7 @@ def example_timed_acquisition():
     print(f"Total counts: {int(np.sum(spectrum))}\n")
 
     ctrl.stop()
+    ctrl.disconnect()
     time.sleep(1)
 
 
@@ -97,6 +141,7 @@ def example_periodic_logging():
         ctrl.stop_periodic_logging()
 
     ctrl.stop()
+    ctrl.disconnect()
     plt.ioff()
     print(f"\nLogging complete. File written to {ctrl._log_filename}\n")
 
@@ -104,10 +149,12 @@ def example_periodic_logging():
 if __name__ == "__main__":
     print("Hamamatsu Detector Example Program")
     print("==================================")
+    print("0. Device Info (threshold, limits, EEPROM)")
     print("1. Timed Acquisition (10 s)")
     print("2. Periodic Logging (15 s interval for 1 min)\n")
 
     try:
+        example_device_info()
         example_timed_acquisition()
         example_periodic_logging()
     except KeyboardInterrupt:
