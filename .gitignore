@@ -167,3 +167,4 @@ cython_debug/
 
 # Project files
 **hamamatsuLibrary.py
+**calibration_*.json

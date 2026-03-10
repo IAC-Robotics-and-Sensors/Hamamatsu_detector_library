@@ -17,13 +17,16 @@ Features:
  - Internal temperature read
  - Module reset
  - Log scale toggle
+ - Energy calibration (channel → keV) via interactive marker placement
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
@@ -34,6 +37,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -42,6 +46,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -72,6 +78,13 @@ class MainWindow(QMainWindow):
 
         self.controller = HamamatsuController(verbose=True)
         self._acquiring = False
+
+        # Calibration state
+        self._cal_markers: list[dict] = []   # [{"channel": int, "energy": float}, ...]
+        self._cal_poly: np.poly1d | None = None  # fitted polynomial (channel -> energy)
+        self._cal_applied = False
+        self._pick_mode = False
+        self._marker_lines: list = []  # matplotlib Line2D vertical markers
 
         self._build_ui()
         self._connect_signals()
@@ -120,6 +133,11 @@ class MainWindow(QMainWindow):
         settings_tab = QWidget()
         tabs.addTab(settings_tab, "Settings")
         self._build_settings_tab(settings_tab)
+
+        # --- Calibration tab ---
+        cal_tab = QWidget()
+        tabs.addTab(cal_tab, "Calibration")
+        self._build_calibration_tab(cal_tab)
 
         # --- EEPROM tab ---
         eeprom_tab = QWidget()
@@ -274,6 +292,79 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
+    # -- Calibration tab ------------------------------------------------------
+    def _build_calibration_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
+
+        # ── marker picking ───────────────────────────────────────────────────
+        grp_pick = QGroupBox("Marker Placement")
+        gp = QHBoxLayout(grp_pick)
+        self.chk_pick_mode = QCheckBox("Enable marker picking (click on spectrum)")
+        gp.addWidget(self.chk_pick_mode)
+        gp.addStretch()
+        lay.addWidget(grp_pick)
+
+        # ── calibration points table ─────────────────────────────────────────
+        grp_table = QGroupBox("Calibration Points")
+        gt = QVBoxLayout(grp_table)
+        self.cal_table = QTableWidget(0, 2)
+        self.cal_table.setHorizontalHeaderLabels(["Channel", "Energy (keV)"])
+        self.cal_table.horizontalHeader().setStretchLastSection(True)
+        self.cal_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.cal_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        gt.addWidget(self.cal_table)
+
+        tbl_btns = QHBoxLayout()
+        self.btn_remove_marker = QPushButton("Remove Selected")
+        self.btn_clear_markers = QPushButton("Clear Markers")
+        self.btn_clear_all_cal = QPushButton("Clear All (incl. calibration)")
+        self.btn_clear_all_cal.setStyleSheet("color: red;")
+        tbl_btns.addWidget(self.btn_remove_marker)
+        tbl_btns.addWidget(self.btn_clear_markers)
+        tbl_btns.addWidget(self.btn_clear_all_cal)
+        tbl_btns.addStretch()
+        gt.addLayout(tbl_btns)
+        lay.addWidget(grp_table)
+
+        # ── polynomial fit ───────────────────────────────────────────────────
+        grp_fit = QGroupBox("Polynomial Fit")
+        gf = QHBoxLayout(grp_fit)
+        gf.addWidget(QLabel("Polynomial order:"))
+        self.spin_poly_order = QSpinBox()
+        self.spin_poly_order.setRange(1, 5)
+        self.spin_poly_order.setValue(1)
+        gf.addWidget(self.spin_poly_order)
+        self.btn_fit_cal = QPushButton("Fit")
+        gf.addWidget(self.btn_fit_cal)
+        self.chk_apply_cal = QCheckBox("Apply calibration to plot")
+        gf.addWidget(self.chk_apply_cal)
+        gf.addStretch()
+        lay.addWidget(grp_fit)
+
+        # ── coefficients display ─────────────────────────────────────────────
+        grp_coeff = QGroupBox("Calibration Coefficients")
+        gc = QVBoxLayout(grp_coeff)
+        self.lbl_cal_coeffs = QLabel("No calibration computed yet.")
+        self.lbl_cal_coeffs.setWordWrap(True)
+        gc.addWidget(self.lbl_cal_coeffs)
+        lay.addWidget(grp_coeff)
+
+        # ── save / load ──────────────────────────────────────────────────────
+        grp_io = QGroupBox("Save / Load")
+        gio = QHBoxLayout(grp_io)
+        self.btn_save_cal = QPushButton("Save Calibration\u2026")
+        self.btn_load_cal = QPushButton("Load Calibration\u2026")
+        gio.addWidget(self.btn_save_cal)
+        gio.addWidget(self.btn_load_cal)
+        gio.addStretch()
+        lay.addWidget(grp_io)
+
+        lay.addStretch()
+
     # -- EEPROM tab ----------------------------------------------------------
     def _build_eeprom_tab(self, parent: QWidget):
         lay = QVBoxLayout(parent)
@@ -316,6 +407,20 @@ class MainWindow(QMainWindow):
         self.btn_reset_module.clicked.connect(self._on_reset_module)
         self.btn_read_eeprom.clicked.connect(self._on_read_eeprom)
 
+        # Calibration signals
+        self.chk_pick_mode.stateChanged.connect(self._on_pick_mode_toggled)
+        self.btn_remove_marker.clicked.connect(self._on_remove_marker)
+        self.btn_clear_markers.clicked.connect(self._on_clear_markers)
+        self.btn_clear_all_cal.clicked.connect(self._on_clear_all_cal)
+        self.btn_fit_cal.clicked.connect(self._on_fit_calibration)
+        self.chk_apply_cal.stateChanged.connect(self._on_apply_calibration)
+        self.btn_save_cal.clicked.connect(self._on_save_calibration)
+        self.btn_load_cal.clicked.connect(self._on_load_calibration)
+        self.cal_table.cellChanged.connect(self._on_cal_table_edited)
+
+        # Matplotlib pick event
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+
     # ── helpers ──────────────────────────────────────────────────────────────
     def _set_controls_enabled(self, on: bool):
         for w in (
@@ -344,6 +449,235 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _append_log(self, msg: str):
         self.log_box.append(msg)
+
+    # ── calibration helpers ──────────────────────────────────────────────────
+    def _sync_table_to_markers(self):
+        """Rebuild the QTableWidget rows from *self._cal_markers*."""
+        self.cal_table.blockSignals(True)
+        self.cal_table.setRowCount(len(self._cal_markers))
+        for row, m in enumerate(self._cal_markers):
+            ch_item = QTableWidgetItem(str(m["channel"]))
+            ch_item.setFlags(ch_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.cal_table.setItem(row, 0, ch_item)
+            en_item = QTableWidgetItem(f"{m['energy']:.2f}")
+            self.cal_table.setItem(row, 1, en_item)
+        self.cal_table.blockSignals(False)
+
+    def _update_marker_lines(self):
+        """Draw vertical lines on the spectrum for each calibration marker."""
+        for ln in self._marker_lines:
+            ln.remove()
+        self._marker_lines.clear()
+
+        for m in self._cal_markers:
+            xval = m["channel"]
+            if self._cal_applied and self._cal_poly is not None:
+                xval = float(self._cal_poly(m["channel"]))
+            ln = self.ax.axvline(
+                xval, color="red", linestyle="--", linewidth=0.9, alpha=0.7
+            )
+            self._marker_lines.append(ln)
+        self.canvas.draw_idle()
+
+    def _rebuild_plot_xaxis(self):
+        """Switch x-axis between channels and calibrated energy."""
+        if self._line is None:
+            return
+        n = len(self._line.get_ydata())
+        if self._cal_applied and self._cal_poly is not None:
+            x = self._cal_poly(np.arange(n))
+            self.ax.set_xlabel("Energy (keV)")
+        else:
+            x = np.arange(n, dtype=float)
+            self.ax.set_xlabel("Channel")
+        self._line.set_xdata(x)
+        self.ax.set_xlim(x.min(), x.max())
+        self._update_marker_lines()
+        self.canvas.draw_idle()
+
+    # ── calibration slots ────────────────────────────────────────────────────
+    def _on_pick_mode_toggled(self, state):
+        self._pick_mode = bool(state)
+        if self._pick_mode:
+            self._log("Marker pick mode ON — click on spectrum to place markers.")
+        else:
+            self._log("Marker pick mode OFF.")
+
+    def _on_canvas_click(self, event):
+        """Handle matplotlib click — add a calibration marker."""
+        if not self._pick_mode:
+            return
+        if event.inaxes != self.ax:
+            return
+        if event.button != 1:  # left-click only
+            return
+
+        # Determine channel from click position
+        if self._cal_applied and self._cal_poly is not None:
+            n = 4096
+            energies = self._cal_poly(np.arange(n))
+            channel = int(np.argmin(np.abs(energies - event.xdata)))
+        else:
+            channel = int(round(event.xdata))
+        channel = max(0, min(channel, 4095))
+
+        # Avoid duplicate channels
+        if any(m["channel"] == channel for m in self._cal_markers):
+            self._log(f"Channel {channel} already has a marker.")
+            return
+
+        self._cal_markers.append({"channel": channel, "energy": 0.0})
+        self._cal_markers.sort(key=lambda m: m["channel"])
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Marker added at channel {channel}. Enter its energy in the table.")
+
+    def _on_cal_table_edited(self, row, col):
+        """User edited an energy value in the calibration table."""
+        if col != 1:
+            return
+        item = self.cal_table.item(row, col)
+        if item is None:
+            return
+        try:
+            energy = float(item.text())
+        except ValueError:
+            self._log(f"Invalid energy value: {item.text()!r}")
+            return
+        if 0 <= row < len(self._cal_markers):
+            self._cal_markers[row]["energy"] = energy
+
+    def _on_remove_marker(self):
+        rows = sorted(
+            {idx.row() for idx in self.cal_table.selectedIndexes()}, reverse=True
+        )
+        if not rows:
+            return
+        for r in rows:
+            if 0 <= r < len(self._cal_markers):
+                del self._cal_markers[r]
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Removed {len(rows)} marker(s).")
+
+    def _on_clear_markers(self):
+        """Remove all markers but keep the current calibration polynomial."""
+        self._cal_markers.clear()
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log("Markers cleared (calibration retained).")
+
+    def _on_clear_all_cal(self):
+        """Remove markers *and* reset the calibration polynomial."""
+        self._cal_markers.clear()
+        self._cal_poly = None
+        self._cal_applied = False
+        self.chk_apply_cal.setChecked(False)
+        self.lbl_cal_coeffs.setText("No calibration computed yet.")
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._rebuild_plot_xaxis()
+        self._log("All calibration markers and fit cleared.")
+
+    def _on_fit_calibration(self):
+        order = self.spin_poly_order.value()
+        pts = [
+            (m["channel"], m["energy"])
+            for m in self._cal_markers
+            if m["energy"] != 0.0
+        ]
+        if len(pts) < order + 1:
+            QMessageBox.warning(
+                self,
+                "Calibration",
+                f"Need at least {order + 1} points with non-zero energies for a "
+                f"degree-{order} polynomial (have {len(pts)}).",
+            )
+            return
+        channels = np.array([p[0] for p in pts], dtype=float)
+        energies = np.array([p[1] for p in pts], dtype=float)
+        coeffs = np.polyfit(channels, energies, order)
+        self._cal_poly = np.poly1d(coeffs)
+
+        # Build display string
+        terms = []
+        for i, c in enumerate(coeffs):
+            power = order - i
+            if power == 0:
+                terms.append(f"{c:+.6g}")
+            elif power == 1:
+                terms.append(f"{c:+.6g}\u00b7ch")
+            else:
+                terms.append(f"{c:+.6g}\u00b7ch^{power}")
+        eqn = "E(ch) = " + " ".join(terms)
+        self.lbl_cal_coeffs.setText(eqn)
+        self._log(f"Calibration fit (order {order}): {eqn}")
+
+        # If calibration is already applied, refresh
+        if self._cal_applied:
+            self._rebuild_plot_xaxis()
+
+    def _on_apply_calibration(self, state):
+        if state and self._cal_poly is None:
+            QMessageBox.warning(self, "Calibration", "Compute a fit first.")
+            self.chk_apply_cal.setChecked(False)
+            return
+        self._cal_applied = bool(state)
+        self._rebuild_plot_xaxis()
+        if self._cal_applied:
+            self._log("Calibration applied \u2014 x-axis now shows energy (keV).")
+        else:
+            self._log("Calibration removed \u2014 x-axis shows channels.")
+
+    def _on_save_calibration(self):
+        default_name = f"calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Calibration", default_name, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        data = {
+            "markers": self._cal_markers,
+            "poly_order": self.spin_poly_order.value(),
+            "coefficients": list(self._cal_poly.coeffs) if self._cal_poly else None,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        self._log(f"Calibration saved to {path}")
+
+    def _on_load_calibration(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        with open(path) as f:
+            data = json.load(f)
+        self._cal_markers = data.get("markers", [])
+        order = data.get("poly_order", 1)
+        self.spin_poly_order.setValue(order)
+        coeffs = data.get("coefficients")
+        if coeffs is not None:
+            self._cal_poly = np.poly1d(coeffs)
+            deg = len(coeffs) - 1
+            terms = []
+            for i, c in enumerate(coeffs):
+                power = deg - i
+                if power == 0:
+                    terms.append(f"{c:+.6g}")
+                elif power == 1:
+                    terms.append(f"{c:+.6g}\u00b7ch")
+                else:
+                    terms.append(f"{c:+.6g}\u00b7ch^{power}")
+            self.lbl_cal_coeffs.setText("E(ch) = " + " ".join(terms))
+        else:
+            self._cal_poly = None
+            self.lbl_cal_coeffs.setText("No calibration computed yet.")
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Calibration loaded from {path}")
 
     # ── connection slots ─────────────────────────────────────────────────────
     def _on_connect(self):
@@ -445,18 +779,28 @@ class MainWindow(QMainWindow):
         self.lbl_elapsed.setText(f"Time: {elapsed:.1f} s")
 
         # Update plot
-        x = np.arange(len(spec))
+        channels = np.arange(len(spec))
+        if self._cal_applied and self._cal_poly is not None:
+            x = self._cal_poly(channels)
+        else:
+            x = channels.astype(float)
+
         if self._line is None:
             self._line, = self.ax.plot(x, spec, linewidth=0.8)
-            self.ax.set_xlim(0, len(spec))
+            self.ax.set_xlim(x.min(), x.max())
         else:
+            self._line.set_xdata(x)
             self._line.set_ydata(spec)
+            self.ax.set_xlim(x.min(), x.max())
 
         ymax = max(spec.max(), 1)
         if self.chk_log_scale.isChecked():
             self.ax.set_ylim(0.5, ymax * 2)
         else:
             self.ax.set_ylim(0, ymax * 1.1)
+
+        # Refresh marker positions
+        self._update_marker_lines()
 
         self.canvas.draw_idle()
 
