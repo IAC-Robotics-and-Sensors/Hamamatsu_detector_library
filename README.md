@@ -1,24 +1,29 @@
 # Hamamatsu Detector Control & GUI
 
-A Python interface for collecting gamma-ray spectra from a **Hamamatsu** scintillation detector over USB.
+A Python interface for collecting gamma-ray spectra from a **Hamamatsu C12137** scintillation detector over USB.
 
 This project provides:
 - A **thread-safe controller class (`HamamatsuController`)** for data acquisition.
-- A **Tkinter + Matplotlib GUI (`hamamatsu_gui.py`)** for live monitoring, timed acquisition, and periodic logging.
+- A **PyQt6 + Matplotlib GUI (`hamamatsu_gui.py`)** for live monitoring, timed acquisition, periodic logging, and energy calibration.
 - An **example script** for programmatic use (`hamamatsu_example_acquisition.py`).
 
 ---
 
 ## Features
 
-- Automatic USB device discovery (`idVendor=0x0661`, `idProduct=0x2917`)
-- Optional USB hub power cycling via `uhubctl` to recover freezes
-- Continuous background acquisition in a thread
-- 4096-channel cumulative spectrum (12-bit -> 16-channel binning)
-- Real-time counts-per-second (CPS) estimate from a sliding time window
-- Temperature and device time reporting
-- Timed (fixed-duration) acquisitions
-- Periodic logging to timestamped CSV files with per-spectrum `Δt`
+- **Automatic USB device discovery** (`idVendor=0x0661`, `idProduct=0x2917`)
+- **Connect / Disconnect lifecycle** with status display
+- **Continuous background acquisition** in a daemon thread
+- 4096-channel cumulative spectrum
+- **Real-time counts-per-second (CPS)** estimate from a sliding time window
+- **Temperature and device time reporting**
+- **Timed (fixed-duration) acquisitions**
+- **Periodic logging** to timestamped CSV files with per-spectrum `Δt`
+- **Log scale toggle** for the spectrum plot
+- **Energy calibration** — interactive marker placement, polynomial fit (order 1–5), save/load calibration as JSON
+- **Energy threshold get/set**, **radiation limits get/set**
+- **EEPROM reading** (comparator threshold, energy limits, calibration coefficient)
+- **Internal temperature reading**, **module reset**
 - Clean shutdown and thread-safe access to data
 
 ---
@@ -27,10 +32,14 @@ This project provides:
 
 ```
 .
-├── hamamatsu_controller.py        # Threaded detector controller
-├── hamamatsu_gui.py               # Interactive GUI with live spectrum
-├── hamamatsu_example_acquisition.py # Example script for timed/periodic runs
-└── README_hamamatsu.md
+├── c12137_comm.py                    # Low-level USB communication with C12137
+├── hamamatsu_controller.py           # Threaded detector controller
+├── hamamatsu_gui.py                  # PyQt6 GUI with live spectrum & calibration
+├── hamamatsu_example_acquisition.py  # Example script for timed/periodic runs
+├── requirements.txt                  # Python dependencies
+├── Dockerfile                        # Optional: container for deployment
+├── run_hamamatsu_docker.sh           # Docker run helper script
+└── README.md
 ```
 
 ---
@@ -50,8 +59,10 @@ You’ll need Python ≥ 3.8.
 Install Python dependencies:
 
 ```bash
-pip install -r requirements_hamamatsu.txt
+pip install -r requirements.txt
 ```
+
+Dependencies: `numpy`, `matplotlib`, `pyusb`, `PyQt6`
 
 System dependencies:
 - `uhubctl` (optional, but recommended on Raspberry Pi / USB hub systems for power cycling)
@@ -200,13 +211,22 @@ Run the live GUI:
 python hamamatsu_gui.py
 ```
 
-Features:
-- **Start / Stop** acquisition
-- **Reset** spectrum and timing
-- **Save Spectrum** to text
-- **Acquire Fixed Spectrum** for N seconds
-- **Periodic Logging** with interval + total time
-- Live status bar with **elapsed time**, **CPS**, **temperature**, and **Δt** during logging
+**Tabs and features:**
+
+| Tab | Features |
+|-----|----------|
+| **Spectrum** | Live plot, Start/Stop/Clear/Save, log scale toggle, CPS, temperature, total counts, elapsed time |
+| **Acquisition** | Timed acquisition (fixed duration), periodic logging (interval + total time) |
+| **Settings** | Energy threshold get/set, radiation limits (lower/upper keV), internal temperature, module reset |
+| **Calibration** | Interactive marker placement on spectrum, polynomial fit (order 1–5), apply to x-axis, save/load calibration JSON |
+| **EEPROM** | Read EEPROM values (comparator threshold, energy limits, calibration coefficient) |
+
+**Workflow:**
+1. Click **Connect** to find and open the Hamamatsu USB device.
+2. Click **Start Acquisition** to begin collecting spectra.
+3. Use the **Calibration** tab to map channels to energy (keV).
+4. Use **Save Spectrum** or **Periodic Logging** to export data.
+5. Click **Stop**, then **Disconnect** when finished.
 
 ---
 
@@ -227,11 +247,11 @@ This will:
 ## Output Files
 
 ### Timed Spectrum
-`hamamatsu_timed_spectrum.txt`  
+`hamamatsu_timed_spectrum.txt`
 → Text file with 4096 counts (one per channel).
 
 ### Periodic Log
-`<base>_YYYYMMDD_HHMMSS.csv`  
+`<base>_YYYYMMDD_HHMMSS.csv`
 Example: `hamamatsu_periodic_log_20251104_143512.csv`
 
 Each row contains:
@@ -246,21 +266,35 @@ Where:
 - `delta_t` is the time between this saved spectrum and the previous one (seconds).
 - `chN` are cumulative counts in each spectrum channel.
 
+### Calibration
+`calibration_YYYYMMDD_HHMMSS.json`
+→ JSON file containing marker points, polynomial order, and fitted coefficients.
+
 ---
 
 ## API Quick Reference
 
 ### Class: `HamamatsuController`
 
-| Method | Description |
-|--------|-------------|
-| `start()` | Connect and begin background acquisition |
-| `stop()` | Stop acquisition and release USB resources |
-| `reset()` | Reset cumulative spectrum, cps and timer |
+| Method / Property | Description |
+|-------------------|-------------|
+| `connect()` | Find and open the USB device; returns `True` on success |
+| `disconnect()` | Stop acquisition and close USB |
+| `is_connected` | Property: whether the device is open |
+| `start()` | Begin background acquisition thread |
+| `stop()` | Stop acquisition and logging |
+| `reset()` | Reset cumulative spectrum, timer, CPS, and history |
 | `get_spectrum()` | Return `(spectrum, elapsed_time, cps, temperature, device_time)` |
 | `acquire_spectrum_for_duration(duration, filename=None)` | Timed acquisition (cumulative) |
 | `start_periodic_logging(base_filename, interval, total_time=0)` | Periodic CSV logging |
 | `stop_periodic_logging()` | Stop ongoing logging |
+| `get_energy_threshold()` | Return `(status, threshold_index)` |
+| `set_energy_threshold(index_val)` | Set energy threshold; returns status |
+| `get_radiation_limit(area)` | `area=0` lower, `area=1` upper; returns `(status, keV)` |
+| `set_radiation_limit(area, value_kev)` | Set radiation limit; returns status |
+| `read_eeprom(address)` | Read EEPROM; returns `(status, data)` |
+| `get_internal_temperature()` | Return `(status, celsius)` |
+| `reset_module(level=0)` | Hardware reset; returns status |
 | `cps` | Current counts per second (sliding window) |
 | `last_delta_t` | Last Δt between logged spectra |
 
