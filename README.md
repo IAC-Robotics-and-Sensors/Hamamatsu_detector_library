@@ -5,6 +5,7 @@ A Python interface for collecting gamma-ray spectra from a **Hamamatsu C12137** 
 This project provides:
 - A **thread-safe controller class (`HamamatsuController`)** for data acquisition.
 - A **PyQt6 + Matplotlib GUI (`hamamatsu_gui.py`)** for live monitoring, timed acquisition, periodic logging, and energy calibration.
+- A **Peak ID-integrated GUI (`hamamatsu_peakid_gui.py`)** that adds isotope identification from the shared `peakID` library.
 - An **example script** for programmatic use (`hamamatsu_example_acquisition.py`).
 
 ---
@@ -35,6 +36,7 @@ This project provides:
 ├── c12137_comm.py                    # Low-level USB communication with C12137
 ├── hamamatsu_controller.py           # Threaded detector controller
 ├── hamamatsu_gui.py                  # PyQt6 GUI with live spectrum & calibration
+├── hamamatsu_peakid_gui.py           # GUI with integrated Peak ID settings + isotope guesses
 ├── hamamatsu_example_acquisition.py  # Example script for timed/periodic runs
 ├── requirements.txt                  # Python dependencies
 ├── Dockerfile                        # Optional: container for deployment
@@ -210,6 +212,23 @@ Run the live GUI:
 ```bash
 python hamamatsu_gui.py
 ```
+
+### Peak ID GUI
+
+Run the integrated GUI with isotope identification:
+
+```bash
+python hamamatsu_peakid_gui.py
+```
+
+This GUI keeps all `hamamatsu_gui.py` functionality and adds:
+- An **Identify Peaks** button on the **Spectrum** tab.
+- A **Peak Identification** table under the spectrum showing isotope guesses and fit statistics.
+- A **Peak ID Settings** tab for runtime control of peak-finding and isotope-ID parameters.
+
+Notes:
+- The Peak ID workflow uses the shared `../peakID/main.py` pipeline.
+- If no peaks are found, the run ends gracefully and **Identify Peaks** is available again.
 
 **Tabs and features:**
 
