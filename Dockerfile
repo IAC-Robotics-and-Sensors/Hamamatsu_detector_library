@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0-dev \
     libopenblas-dev \
     libx11-dev \
+    libxkbcommon-x11-0 \
+    libxcb-cursor0 \
     tk-dev \
     uhubctl \
     git \

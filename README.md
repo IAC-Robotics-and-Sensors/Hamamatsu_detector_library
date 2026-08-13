@@ -72,6 +72,19 @@ System dependencies:
 sudo apt install uhubctl
 ```
 
+If you see this error when launching the GUI:
+
+```
+qt.qpa.plugin: From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb platform plugin.
+```
+
+install Qt runtime dependencies:
+
+```
+sudo apt update
+sudo apt install -y libxcb-cursor0 libxkbcommon-x11-0
+```
+
 #### Udev rules
 
 In order to use this package without super user privlidges, the correct udev rules need to be configured. 
